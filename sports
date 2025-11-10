@@ -1,0 +1,146 @@
+# main.py
+import requests, sqlite3, time, os
+from datetime import datetime, timedelta
+import pandas as pd
+import json
+
+# CONFIG
+DB = "betting.db"
+BALL_KEY = os.getenv("BALL_KEY") or "YOUR_BALLDONTLIE_KEY"
+ODDS_KEY = os.getenv("ODDS_KEY") or "YOUR_ODDSAPI_KEY"
+WEATHER_KEY = os.getenv("WEATHER_KEY") or "YOUR_OPENWEATHER_KEY"
+
+conn = sqlite3.connect(DB, check_same_thread=False)
+c = conn.cursor()
+
+# Tables
+c.execute('''CREATE TABLE IF NOT EXISTS games (id TEXT PRIMARY KEY, sport TEXT, home TEXT, away TEXT, date TEXT, home_score INT, away_score INT, status TEXT)''')
+c.execute('''CREATE TABLE IF NOT EXISTS player_stats (game_id TEXT, player TEXT, team TEXT, pts INT, reb INT, ast INT, fg_pct REAL)''')
+c.execute('''CREATE TABLE IF NOT EXISTS injuries (player TEXT, team TEXT, status TEXT, injury TEXT, sport TEXT)''')
+c.execute('''CREATE TABLE IF NOT EXISTS odds (game_id TEXT, bookmaker TEXT, market TEXT, home_odds REAL, away_odds REAL, total REAL, spread REAL)''')
+c.execute('''CREATE TABLE IF NOT EXISTS weather (game_id TEXT, temp REAL, wind REAL, precip TEXT, description TEXT)''')
+c.execute('''CREATE TABLE IF NOT EXISTS historical_games (id TEXT, season INT, home TEXT, away TEXT, home_pts INT, away_pts INT, weather TEXT)''')
+conn.commit()
+
+# Stadium coords for weather (NFL only)
+STADIUMS = {
+    "Kansas City Chiefs": (39.0489, -94.4839), "Buffalo Bills": (42.7738, -78.7870),
+    # Add more as needed – full list in comments below
+}
+
+def upsert(table, data, key="id"):
+    placeholders = ",".join(["?"] * len(data))
+    cols = ",".join(data.keys())
+    updates = ",".join([f"{k}=excluded.{k}" for k in data])
+    sql = f"INSERT INTO {table} VALUES ({placeholders}) ON CONFLICT({key}) DO UPDATE SET {updates}"
+    c.execute(sql, list(data.values()))
+    conn.commit()
+
+# BALLDONTLIE HEADERS
+ball_headers = {"Authorization": BALL_KEY}
+
+# Fetch live + today's games
+def fetch_games():
+    for sport in ["nba", "nfl"]:
+        url = f"https://api.balldontlie.io/v1/games?seasons[]=2025"
+        r = requests.get(url, headers=ball_headers).json().get("data", [])
+        for g in r:
+            gid = str(g["id"])
+            upsert("games", {"id": gid, "sport": sport.upper(), "home": g["home_team"]["name"],
+                            "away": g["visitor_team"]["name"], "date": g["date"], "home_score": g["home_team_score"],
+                            "away_score": g["visitor_team_score"], "status": g["status"]})
+
+# Player stats
+def fetch_player_stats():
+    games = pd.read_sql("SELECT id FROM games WHERE status='Final' AND date > '2025-01-01'", conn)
+    for gid in games["id"]:
+        url = f"https://api.balldontlie.io/v1/stats?game_ids[]={gid}"
+        stats = requests.get(url, headers=ball_headers).json().get("data", [])
+        for s in stats:
+            upsert("player_stats", {"game_id": gid, "player": s["player"]["full_name"],
+                                   "team": s["team"]["name"], "pts": s["pts"], "reb": s["reb"],
+                                   "ast": s["ast"], "fg_pct": s.get("fg_pct", 0)}, key="game_id,player")
+
+# Injuries
+def fetch_injuries():
+    url = "https://api.balldontlie.io/v1/injuries"
+    inj = requests.get(url, headers=ball_headers).json().get("data", [])
+    for i in inj:
+        upsert("injuries", {"player": i["player"]["name"], "team": i["team"]["name"],
+                            "status": i["status"], "injury": i["type"], "sport": i["league"].upper()})
+
+# Odds from multiple books
+def fetch_odds():
+    sports = {"basketball_nba": "NBA", "americanfootball_nfl": "NFL"}
+    for key, name in sports.items():
+        url = f"https://api.theoddsapi.com/v4/sports/{key}/odds"
+        params = {"apiKey": ODDS_KEY, "regions": "us", "markets": "h2h,spreads,totals", "oddsFormat": "american"}
+        data = requests.get(url, params=params).json()
+        for game in data:
+            gid = game["id"]
+            for book in game["bookmakers"]:
+                for m in book["markets"]:
+                    if m["key"] == "h2h":
+                        home_o = m["outcomes"][0]["price"] if m["outcomes"][0]["name"] == game["home_team"] else m["outcomes"][1]["price"]
+                        away_o = m["outcomes"][1]["price"] if m["outcomes"][0]["name"] == game["home_team"] else m["outcomes"][0]["price"]
+                        upsert("odds", {"game_id": gid, "bookmaker": book["title"], "market": "ml",
+                                        "home_odds": home_o, "away_odds": away_o, "total": 0, "spread": 0})
+                    # Add spreads/totals similarly...
+
+# Weather (NFL only)
+def fetch_weather():
+    games = pd.read_sql("SELECT id, home, date FROM games WHERE sport='NFL' AND date LIKE '2025%'", conn)
+    for _, row in games.iterrows():
+        team = row["home"]
+        if team not in STADIUMS: continue
+        lat, lon = STADIUMS[team]
+        dt = datetime.fromisoformat(row["date"].replace("Z", "+00:00"))
+        url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={WEATHER_KEY}&units=imperial"
+        w = requests.get(url).json()
+        upsert("weather", {"game_id": row["id"], "temp": w["main"]["temp"], "wind": w["wind"]["speed"],
+                           "precip": w.get("rain", {}).get("1h", 0), "description": w["weather"][0]["description"]})
+
+# Historical load (2022-2024)
+def load_historical():
+    for year in [2022, 2023, 2024]:
+        for sport in ["nba", "nfl"]:
+            url = f"https://api.balldontlie.io/v1/games?seasons[]={year}"
+            # Same as fetch_games but insert into historical_games
+
+# BEST BETS ENGINE
+def generate_best_bets():
+    today = datetime.now().strftime("%Y-%m-%d")
+    games = pd.read_sql(f"SELECT * FROM games WHERE date LIKE '{today}%'", conn)
+    bets = []
+    for _, g in games.iterrows():
+        # Avg points last 3 years
+        hist = pd.read_sql(f"SELECT AVG(home_pts) as home_avg, AVG(away_pts) as away_avg FROM historical_games WHERE home='{g.home}' OR away='{g.home}'", conn)
+        proj_total = hist["home_avg"].iloc[0] + hist["away_avg"].iloc[0]
+        # Injury adjustment
+        key_inj = pd.read_sql(f"SELECT * FROM injuries WHERE team IN ('{g.home}','{g.away}') AND status='Out'", conn)
+        if len(key_inj) > 2: proj_total *= 0.92
+        # Weather adjustment (NFL)
+        if g.sport == "NFL":
+            w = pd.read_sql(f"SELECT * FROM weather WHERE game_id='{g.id}'", conn)
+            if not w.empty and (w["wind"].iloc[0] > 15 or w["precip"].iloc[0] > 0): proj_total *= 0.85
+        # Market lines
+        lines = pd.read_sql(f"SELECT AVG(total) as avg_total FROM odds WHERE game_id='{g.id}' AND market='totals'", conn)
+        market_total = lines["avg_total"].iloc[0] if not lines.empty else proj_total
+        edge = proj_total - market_total
+        if abs(edge) > 4:
+            bet = "OVER" if edge > 0 else "UNDER"
+            bets.append(f"{g.home} vs {g.away} - {bet} {market_total} (Edge: {edge:.1f} pts)")
+    with open("best_bets.txt", "w") as f:
+        f.write("\n".join(bets) if bets else "No +EV bets today")
+
+if __name__ == "__main__":
+    load_historical()  # Run once
+    while True:
+        fetch_games()
+        fetch_player_stats()
+        fetch_injuries()
+        fetch_odds()
+        fetch_weather()
+        generate_best_bets()
+        print(f"{datetime.now()} - Updated + Best Bets Generated")
+        time.sleep(300)  # 5 min 
